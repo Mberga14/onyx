@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import os
 import time
+from collections.abc import Iterator
 from collections.abc import Mapping
 from datetime import datetime
 from datetime import timezone
@@ -7,7 +10,11 @@ from io import BytesIO
 from numbers import Integral
 from typing import Any
 from typing import Optional
+from typing import TYPE_CHECKING
 from urllib.parse import quote
+
+if TYPE_CHECKING:
+    from google.cloud.storage import Client as GCSClient
 
 import boto3
 from botocore.client import Config
@@ -71,6 +78,9 @@ class BlobStorageConnector(LoadConnector, PollConnector):
         self.prefix = prefix if not prefix or prefix.endswith("/") else prefix + "/"
         self.batch_size = batch_size
         self.s3_client: Optional[S3Client] = None
+        # Native GCS client used when authenticating via service account or ADC
+        # (Workload Identity). When set, takes precedence over self.s3_client.
+        self._gcs_native_client: GCSClient | None = None
         self._allow_images: bool | None = None
         self.size_threshold: int | None = BLOB_STORAGE_SIZE_THRESHOLD
         self.bucket_region: Optional[str] = None
@@ -86,17 +96,15 @@ class BlobStorageConnector(LoadConnector, PollConnector):
     def _detect_bucket_region(self) -> None:
         """Detect and cache the actual region of the S3 bucket using head_bucket."""
         if self.s3_client is None:
-            logger.warning(
-                "S3 client not initialized. Skipping bucket region detection."
-            )
+            logger.warning("S3 client not initialized. Skipping bucket region detection.")
             return
 
         try:
             response = self.s3_client.head_bucket(Bucket=self.bucket_name)
             # The region is in the response headers as 'x-amz-bucket-region'
-            self.bucket_region = response.get("BucketRegion") or response.get(
-                "ResponseMetadata", {}
-            ).get("HTTPHeaders", {}).get("x-amz-bucket-region")
+            self.bucket_region = response.get("BucketRegion") or response.get("ResponseMetadata", {}).get("HTTPHeaders", {}).get(
+                "x-amz-bucket-region"
+            )
 
             if self.bucket_region:
                 logger.debug(f"Detected bucket region: {self.bucket_region}")
@@ -122,15 +130,10 @@ class BlobStorageConnector(LoadConnector, PollConnector):
         Raises ValueError for unsupported bucket types.
         """
 
-        logger.debug(
-            f"Loading credentials for {self.bucket_name} or type {self.bucket_type}"
-        )
+        logger.debug(f"Loading credentials for {self.bucket_name} or type {self.bucket_type}")
 
         if self.bucket_type == BlobType.R2:
-            if not all(
-                credentials.get(key)
-                for key in ["r2_access_key_id", "r2_secret_access_key", "account_id"]
-            ):
+            if not all(credentials.get(key) for key in ["r2_access_key_id", "r2_secret_access_key", "account_id"]):
                 raise ConnectorMissingCredentialError("Cloudflare R2")
 
             # Use EU endpoint if european_residency is enabled
@@ -148,18 +151,11 @@ class BlobStorageConnector(LoadConnector, PollConnector):
 
         elif self.bucket_type == BlobType.S3:
             # For S3, we can use either access keys or IAM roles.
-            authentication_method = credentials.get(
-                "authentication_method", "access_key"
-            )
-            logger.debug(
-                f"Using authentication method: {authentication_method} for S3 bucket."
-            )
+            authentication_method = credentials.get("authentication_method", "access_key")
+            logger.debug(f"Using authentication method: {authentication_method} for S3 bucket.")
             if authentication_method == "access_key":
                 logger.debug("Using access key authentication for S3 bucket.")
-                if not all(
-                    credentials.get(key)
-                    for key in ["aws_access_key_id", "aws_secret_access_key"]
-                ):
+                if not all(credentials.get(key) for key in ["aws_access_key_id", "aws_secret_access_key"]):
                     raise ConnectorMissingCredentialError("Amazon S3")
 
                 session = boto3.Session(
@@ -172,9 +168,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                 role_arn = credentials.get("aws_role_arn")
                 # create session name using timestamp
                 if not role_arn:
-                    raise ConnectorMissingCredentialError(
-                        "Amazon S3 IAM role ARN is required for assuming role."
-                    )
+                    raise ConnectorMissingCredentialError("Amazon S3 IAM role ARN is required for assuming role.")
 
                 def _refresh_credentials() -> dict[str, str]:
                     """Refreshes the credentials for the assumed role."""
@@ -214,24 +208,48 @@ class BlobStorageConnector(LoadConnector, PollConnector):
             self._detect_bucket_region()
 
         elif self.bucket_type == BlobType.GOOGLE_CLOUD_STORAGE:
-            if not all(
-                credentials.get(key) for key in ["access_key_id", "secret_access_key"]
-            ):
-                raise ConnectorMissingCredentialError("Google Cloud Storage")
+            authentication_method = credentials.get("authentication_method", "access_key")
+            logger.debug(f"Using authentication method: {authentication_method} for GCS bucket.")
 
-            self.s3_client = boto3.client(
-                "s3",
-                endpoint_url="https://storage.googleapis.com",
-                aws_access_key_id=credentials["access_key_id"],
-                aws_secret_access_key=credentials["secret_access_key"],
-                region_name="auto",
-            )
+            if authentication_method == "access_key":
+                # Existing HMAC path via boto3 S3-compatible endpoint
+                if not all(credentials.get(key) for key in ["access_key_id", "secret_access_key"]):
+                    raise ConnectorMissingCredentialError("Google Cloud Storage")
+
+                self.s3_client = boto3.client(
+                    "s3",
+                    endpoint_url="https://storage.googleapis.com",
+                    aws_access_key_id=credentials["access_key_id"],
+                    aws_secret_access_key=credentials["secret_access_key"],
+                    region_name="auto",
+                )
+
+            elif authentication_method == "service_account":
+                import json as json_module
+
+                from google.cloud import storage
+                from google.oauth2 import service_account as sa_module
+
+                sa_json = credentials.get("service_account_json")
+                if not sa_json:
+                    raise ConnectorMissingCredentialError("Google Cloud Storage service account JSON")
+                info = json_module.loads(sa_json) if isinstance(sa_json, str) else sa_json
+                creds = sa_module.Credentials.from_service_account_info(info)
+                self._gcs_native_client = storage.Client(credentials=creds, project=info.get("project_id"))
+
+            elif authentication_method == "adc":
+                # ADC / Workload Identity — no credentials needed.
+                # NOTE: This inherits the pod's service account permissions.
+                # Ensure the SA is scoped to only the intended buckets via IAM.
+                from google.cloud import storage
+
+                self._gcs_native_client = storage.Client()
+
+            else:
+                raise ConnectorValidationError("Invalid authentication method for GCS.")
 
         elif self.bucket_type == BlobType.OCI_STORAGE:
-            if not all(
-                credentials.get(key)
-                for key in ["namespace", "region", "access_key_id", "secret_access_key"]
-            ):
+            if not all(credentials.get(key) for key in ["namespace", "region", "access_key_id", "secret_access_key"]):
                 raise ConnectorMissingCredentialError("Oracle Cloud Infrastructure")
 
             self.s3_client = boto3.client(
@@ -248,6 +266,9 @@ class BlobStorageConnector(LoadConnector, PollConnector):
         return None
 
     def _download_object(self, key: str) -> bytes | None:
+        if self._gcs_native_client is not None:
+            return self._download_object_gcs(key)
+
         if self.s3_client is None:
             raise ConnectorMissingCredentialError("Blob storage")
         response = self.s3_client.get_object(Bucket=self.bucket_name, Key=key)
@@ -261,15 +282,27 @@ class BlobStorageConnector(LoadConnector, PollConnector):
         finally:
             body.close()
 
+    def _download_object_gcs(self, key: str) -> bytes | None:
+        """Download an object using the native GCS client."""
+        bucket = self._gcs_native_client.bucket(self.bucket_name)
+        blob = bucket.blob(key)
+
+        if self.size_threshold is not None:
+            # Check size before downloading to avoid fetching oversized files
+            blob.reload()
+            if blob.size is not None and blob.size > self.size_threshold:
+                logger.warning(f"{key} exceeds size threshold of {self.size_threshold}. Skipping.")
+                return None
+
+        return blob.download_as_bytes()
+
     def _read_stream_with_limit(self, body: Any, key: str) -> bytes | None:
         if self.size_threshold is None:
             return body.read()
 
         bytes_read = 0
         chunks: list[bytes] = []
-        chunk_size = min(
-            DOWNLOAD_CHUNK_SIZE, self.size_threshold + SIZE_THRESHOLD_BUFFER
-        )
+        chunk_size = min(DOWNLOAD_CHUNK_SIZE, self.size_threshold + SIZE_THRESHOLD_BUFFER)
 
         for chunk in body.iter_chunks(chunk_size=chunk_size):
             if not chunk:
@@ -278,9 +311,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
             bytes_read += len(chunk)
 
             if bytes_read > self.size_threshold + SIZE_THRESHOLD_BUFFER:
-                logger.warning(
-                    f"{key} exceeds size threshold of {self.size_threshold}. Skipping."
-                )
+                logger.warning(f"{key} exceeds size threshold of {self.size_threshold}. Skipping.")
                 return None
 
         return b"".join(chunks)
@@ -302,7 +333,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
         # This is because the actual object URL requires S3 client authentication
         # Accessing through the browser will always return an unauthorized error
 
-        if self.s3_client is None:
+        if self.s3_client is None and self._gcs_native_client is None:
             raise ConnectorMissingCredentialError("Blob storage")
 
         # URL encode the key to handle special characters, spaces, etc.
@@ -313,7 +344,9 @@ class BlobStorageConnector(LoadConnector, PollConnector):
             account_id = self.s3_client.meta.endpoint_url.split("//")[1].split(".")[0]
             subdomain = "eu/" if self.european_residency else "default/"
 
-            return f"https://dash.cloudflare.com/{account_id}/r2/{subdomain}buckets/{self.bucket_name}/objects/{encoded_key}/details"
+            return (
+                f"https://dash.cloudflare.com/{account_id}/r2/{subdomain}buckets/{self.bucket_name}/objects/{encoded_key}/details"
+            )
 
         elif self.bucket_type == BlobType.S3:
             region = self.bucket_region or self.s3_client.meta.region_name
@@ -376,24 +409,69 @@ class BlobStorageConnector(LoadConnector, PollConnector):
 
         return None
 
-    def _yield_blob_objects(
+    def _iter_objects(
         self,
-        start: datetime,
-        end: datetime,
-    ) -> GenerateDocumentsOutput:
+    ) -> Iterator[dict[str, Any]]:
+        """Iterate over objects in the bucket, dispatching to native GCS or S3."""
+        if self._gcs_native_client is not None:
+            bucket = self._gcs_native_client.bucket(self.bucket_name)
+            blobs = bucket.list_blobs(prefix=self.prefix)
+            for blob in blobs:
+                # Normalize GCS blob to match the shape used by the S3 path
+                yield {
+                    "Key": blob.name,
+                    "LastModified": blob.updated,
+                    "Size": blob.size,
+                }
+            return
+
         if self.s3_client is None:
             raise ConnectorMissingCredentialError("Blob storage")
 
         paginator = self.s3_client.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=self.bucket_name, Prefix=self.prefix)
-
-        batch: list[Document | HierarchyNode] = []
         for page in pages:
             if "Contents" not in page:
                 continue
+            yield from page["Contents"]
 
-            for obj in page["Contents"]:
-                if obj["Key"].endswith("/"):
+    def _yield_blob_objects(
+        self,
+        start: datetime,
+        end: datetime,
+    ) -> GenerateDocumentsOutput:
+        if self.s3_client is None and self._gcs_native_client is None:
+            raise ConnectorMissingCredentialError("Blob storage")
+
+        batch: list[Document | HierarchyNode] = []
+        for obj in self._iter_objects():
+            if obj["Key"].endswith("/"):
+                continue
+
+            last_modified = obj["LastModified"].replace(tzinfo=timezone.utc)
+
+            if not start <= last_modified <= end:
+                continue
+
+            file_name = os.path.basename(obj["Key"])
+            file_ext = get_file_ext(file_name)
+            key = obj["Key"]
+            link = self._get_blob_link(key)
+
+            size_bytes = self._extract_size_bytes(obj)
+            if (
+                self.size_threshold is not None
+                and isinstance(size_bytes, int)
+                and self.size_threshold is not None
+                and size_bytes > self.size_threshold
+            ):
+                logger.warning(f"{file_name} exceeds size threshold of {self.size_threshold}. Skipping.")
+                continue
+
+            # Handle image files
+            if file_ext in OnyxFileExtensions.IMAGE_EXTENSIONS:
+                if not self._allow_images:
+                    logger.debug(f"Skipping image file: {key} (image processing not enabled)")
                     continue
 
                 last_modified = obj["LastModified"].replace(tzinfo=timezone.utc)
@@ -499,56 +577,78 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                     downloaded_file = self._download_object(key)
                     if downloaded_file is None:
                         continue
-                    extraction_result = extract_text_and_images(
-                        BytesIO(downloaded_file), file_name=file_name
-                    )
 
-                    onyx_metadata, custom_tags = process_onyx_metadata(
-                        extraction_result.metadata
+                    # TODO: Refactor to avoid direct DB access in connector
+                    # This will require broader refactoring across the codebase
+                    image_section, _ = store_image_and_create_section(
+                        image_data=downloaded_file,
+                        file_id=f"{self.bucket_type}_{self.bucket_name}_{key.replace('/', '_')}",
+                        display_name=file_name,
+                        link=link,
+                        file_origin=FileOrigin.CONNECTOR,
                     )
-                    file_display_name = onyx_metadata.file_display_name or file_name
-                    time_updated = onyx_metadata.doc_updated_at or last_modified
-                    link = onyx_metadata.link or link
-                    primary_owners = onyx_metadata.primary_owners
-                    secondary_owners = onyx_metadata.secondary_owners
-                    source_type = onyx_metadata.source_type or DocumentSource(
-                        self.bucket_type.value
-                    )
-
-                    sections: list[TextSection | ImageSection] = []
-                    if extraction_result.text_content.strip():
-                        logger.debug(
-                            f"Creating TextSection for {file_name} with link: {link}"
-                        )
-                        sections.append(
-                            TextSection(
-                                link=link,
-                                text=extraction_result.text_content.strip(),
-                            )
-                        )
 
                     batch.append(
                         Document(
                             id=f"{self.bucket_type}:{self.bucket_name}:{key}",
-                            sections=(
-                                sections
-                                if sections
-                                else [TextSection(link=link, text="")]
-                            ),
-                            source=source_type,
-                            semantic_identifier=file_display_name,
-                            doc_updated_at=time_updated,
-                            metadata=custom_tags,
-                            primary_owners=primary_owners,
-                            secondary_owners=secondary_owners,
+                            sections=[image_section],
+                            source=DocumentSource(self.bucket_type.value),
+                            semantic_identifier=file_name,
+                            doc_updated_at=last_modified,
+                            metadata={},
                         )
                     )
+
                     if len(batch) == self.batch_size:
                         yield batch
                         batch = []
-
                 except Exception:
-                    logger.exception(f"Error decoding object {key} as UTF-8")
+                    logger.exception(f"Error processing image {key}")
+                continue
+
+            # Handle text and document files
+            try:
+                downloaded_file = self._download_object(key)
+                if downloaded_file is None:
+                    continue
+                extraction_result = extract_text_and_images(BytesIO(downloaded_file), file_name=file_name)
+
+                onyx_metadata, custom_tags = process_onyx_metadata(extraction_result.metadata)
+                file_display_name = onyx_metadata.file_display_name or file_name
+                time_updated = onyx_metadata.doc_updated_at or last_modified
+                link = onyx_metadata.link or link
+                primary_owners = onyx_metadata.primary_owners
+                secondary_owners = onyx_metadata.secondary_owners
+                source_type = onyx_metadata.source_type or DocumentSource(self.bucket_type.value)
+
+                sections: list[TextSection | ImageSection] = []
+                if extraction_result.text_content.strip():
+                    logger.debug(f"Creating TextSection for {file_name} with link: {link}")
+                    sections.append(
+                        TextSection(
+                            link=link,
+                            text=extraction_result.text_content.strip(),
+                        )
+                    )
+
+                batch.append(
+                    Document(
+                        id=f"{self.bucket_type}:{self.bucket_name}:{key}",
+                        sections=(sections if sections else [TextSection(link=link, text="")]),
+                        source=source_type,
+                        semantic_identifier=file_display_name,
+                        doc_updated_at=time_updated,
+                        metadata=custom_tags,
+                        primary_owners=primary_owners,
+                        secondary_owners=secondary_owners,
+                    )
+                )
+                if len(batch) == self.batch_size:
+                    yield batch
+                    batch = []
+
+            except Exception:
+                logger.exception(f"Error decoding object {key} as UTF-8")
         if batch:
             yield batch
 
@@ -559,10 +659,8 @@ class BlobStorageConnector(LoadConnector, PollConnector):
             end=datetime.now(timezone.utc),
         )
 
-    def poll_source(
-        self, start: SecondsSinceUnixEpoch, end: SecondsSinceUnixEpoch
-    ) -> GenerateDocumentsOutput:
-        if self.s3_client is None:
+    def poll_source(self, start: SecondsSinceUnixEpoch, end: SecondsSinceUnixEpoch) -> GenerateDocumentsOutput:
+        if self.s3_client is None and self._gcs_native_client is None:
             raise ConnectorMissingCredentialError("Blob storage")
 
         start_datetime = datetime.fromtimestamp(start, tz=timezone.utc)
@@ -573,32 +671,45 @@ class BlobStorageConnector(LoadConnector, PollConnector):
 
         return None
 
-    def validate_connector_settings(self) -> None:
-        if self.s3_client is None:
-            raise ConnectorMissingCredentialError(
-                "Blob storage credentials not loaded."
+    def _validate_gcs_native(self) -> None:
+        """Validate connector settings using the native GCS client."""
+        from google.api_core.exceptions import Forbidden
+        from google.api_core.exceptions import NotFound
+
+        try:
+            bucket = self._gcs_native_client.bucket(self.bucket_name)
+            # Light-weight validation: list one blob to check permissions
+            next(iter(bucket.list_blobs(prefix=self.prefix, max_results=1)), None)
+        except NotFound:
+            raise ConnectorValidationError(f"Bucket '{self.bucket_name}' does not exist or cannot be found.")
+        except Forbidden:
+            raise InsufficientPermissionsError(
+                f"Insufficient permissions to list objects in bucket '{self.bucket_name}'. Please check your IAM policy."
             )
+        except Exception as e:
+            raise UnexpectedValidationError(f"Unexpected error during GCS settings validation: {e}")
+
+    def validate_connector_settings(self) -> None:
+        if self.s3_client is None and self._gcs_native_client is None:
+            raise ConnectorMissingCredentialError("Blob storage credentials not loaded.")
 
         if not self.bucket_name:
-            raise ConnectorValidationError(
-                "No bucket name was provided in connector settings."
-            )
+            raise ConnectorValidationError("No bucket name was provided in connector settings.")
+
+        # Native GCS client validation path
+        if self._gcs_native_client is not None:
+            self._validate_gcs_native()
+            return
 
         try:
             # We only fetch one object/page as a light-weight validation step.
             # This ensures we trigger typical S3 permission checks (ListObjectsV2, etc.).
-            self.s3_client.list_objects_v2(
-                Bucket=self.bucket_name, Prefix=self.prefix, MaxKeys=1
-            )
+            self.s3_client.list_objects_v2(Bucket=self.bucket_name, Prefix=self.prefix, MaxKeys=1)
 
         except NoCredentialsError:
-            raise ConnectorMissingCredentialError(
-                "No valid blob storage credentials found or provided to boto3."
-            )
+            raise ConnectorMissingCredentialError("No valid blob storage credentials found or provided to boto3.")
         except PartialCredentialsError:
-            raise ConnectorMissingCredentialError(
-                "Partial or incomplete blob storage credentials provided to boto3."
-            )
+            raise ConnectorMissingCredentialError("Partial or incomplete blob storage credentials provided to boto3.")
         except ClientError as e:
             error_code = e.response["Error"].get("Code", "")
             status_code = e.response["ResponseMetadata"].get("HTTPStatusCode")
@@ -615,30 +726,20 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                         "Please check your bucket policy and/or IAM policy."
                     )
                 if status_code == 401 or error_code == "SignatureDoesNotMatch":
-                    raise CredentialExpiredError(
-                        "Provided blob storage credentials appear invalid or expired."
-                    )
+                    raise CredentialExpiredError("Provided blob storage credentials appear invalid or expired.")
 
-                raise CredentialExpiredError(
-                    f"Credential issue encountered ({error_code})."
-                )
+                raise CredentialExpiredError(f"Credential issue encountered ({error_code}).")
 
             if error_code == "NoSuchBucket" or status_code == 404:
-                raise ConnectorValidationError(
-                    f"Bucket '{self.bucket_name}' does not exist or cannot be found."
-                )
+                raise ConnectorValidationError(f"Bucket '{self.bucket_name}' does not exist or cannot be found.")
 
-            raise ConnectorValidationError(
-                f"Unexpected S3 client error (code={error_code}, status={status_code}): {e}"
-            )
+            raise ConnectorValidationError(f"Unexpected S3 client error (code={error_code}, status={status_code}): {e}")
 
         except Exception as e:
             # Catch-all for anything not captured by the above
             # Since we are unsure of the error and it may not disable the connector,
             #  raise an unexpected error (does not disable connector)
-            raise UnexpectedValidationError(
-                f"Unexpected error during blob storage settings validation: {e}"
-            )
+            raise UnexpectedValidationError(f"Unexpected error during blob storage settings validation: {e}")
 
 
 if __name__ == "__main__":
