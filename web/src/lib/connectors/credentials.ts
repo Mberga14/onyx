@@ -190,8 +190,9 @@ export interface S3CredentialJson {
 }
 
 export interface GCSCredentialJson {
-  access_key_id: string;
-  secret_access_key: string;
+  access_key_id?: string;
+  secret_access_key?: string;
+  service_account_json?: string;
 }
 
 export interface OCICredentialJson {
@@ -429,9 +430,39 @@ export const credentialTemplates: Record<ValidSources, any> = {
     r2_secret_access_key: "",
   } as R2CredentialJson,
   google_cloud_storage: {
-    access_key_id: "",
-    secret_access_key: "",
-  } as GCSCredentialJson,
+    authentication_method: "access_key",
+    authMethods: [
+      {
+        value: "access_key",
+        label: "HMAC Access Key",
+        fields: {
+          access_key_id: "",
+          secret_access_key: "",
+        },
+        description:
+          "Use GCS HMAC-compatible access key and secret.",
+        disablePermSync: false,
+      },
+      {
+        value: "service_account",
+        label: "Service Account JSON",
+        fields: {
+          service_account_json: "",
+        },
+        description:
+          "Paste the contents of a GCP service account JSON key file.",
+        disablePermSync: false,
+      },
+      {
+        value: "adc",
+        label: "Workload Identity / ADC",
+        fields: {},
+        description:
+          "Use Application Default Credentials (Workload Identity on GKE, instance SA on Compute Engine). No credentials needed.",
+        disablePermSync: false,
+      },
+    ],
+  } as CredentialTemplateWithAuth<GCSCredentialJson>,
   oci_storage: {
     namespace: "",
     region: "",
@@ -599,6 +630,7 @@ export const credentialDisplayNames: Record<string, string> = {
   // GCS
   access_key_id: "GCS Access Key ID",
   secret_access_key: "GCS Secret Access Key",
+  service_account_json: "Service Account JSON Key",
 
   // OCI
   namespace: "OCI Namespace",
